@@ -1,0 +1,205 @@
+# import xml. files and get the tracking data
+
+import os
+import pandas as pd
+import matplotlib.pylab as plt
+from os import path
+
+
+rootFolderPath = "D:\\Ruilan\\processing data\\240605 palm hocl test\\palm"
+#sometimes the filepath is "/.../.../", define accordingly
+
+n=0
+
+filepaths = []
+conditions = []
+image_files = []
+
+for root, dirs, files in os.walk(rootFolderPath):
+    for filename in files:
+        if filename[-10:] == "tracks.xml":
+            filepath = os.path.join(root, filename)
+            filepaths.append(filepath)
+            conditions.append(filepath.split("\\")[5].split("_")[2])
+            image_files.append(filepath.split("\\")[6].split("_")[0])
+           
+            n+=1
+            
+df= pd.DataFrame(data={"Path":filepaths,"Condition":conditions,"Image file":image_files}).sort_values(by="Condition")
+df["Tracks"] = [[] for i in range (len(df))]
+
+from xml.dom import minidom
+import glob
+from IPython.display import clear_output
+
+def import_track_xml(filepath):
+  tracks = []
+  file_data = minidom.parse(filepath)
+
+  for track in file_data.getElementsByTagName("particle"):
+    detections = track.getElementsByTagName("detection")
+    numSpots = len(detections)
+    track_xy = np.empty([numSpots, 2], dtype=float)
+    for i in range(numSpots):
+      track_xy[i][0] = detections[i].getAttribute("x")
+      track_xy[i][1] = detections[i].getAttribute("y")
+
+    # Add track if all points are at least 1000 nm (10 pixels) from edge of image
+    if np.min([track_xy[:][0], track_xy[:][1], 25600 - track_xy[:][0], 25600 - track_xy[:][1]]) > 500:
+        tracks.append(track_xy)
+
+  return(tracks)
+
+def add_tracks(filepath):
+    global i
+    clear_output(wait=True)
+    i += 1
+    print('Loading',filepath)
+    print('File',i,'of',len(df))
+    tracks = import_track_xml(filepath)
+    print(len(tracks),'tracks loaded')
+    return tracks
+
+i = 0
+df["Tracks"] = df["Path"].apply(add_tracks)
+
+#Display tracking on images
+
+from scipy.ndimage import gaussian_filter,maximum_filter
+import scipy
+
+#calculate the spotmedian
+df['maskImages'] = [ np.zeros((256,256)) for i in range(len(df)) ]
+df['spotMedians'] = [ np.zeros((256,256)) for i in range(len(df)) ]
+spotMedians = np.zeros((len(files),256,256))
+medIdx = df.columns.get_loc('spotMedians')
+
+i = 0
+for f in range(len(df)):
+    i += 1
+    clear_output(wait=True)
+    print('Median spots for file',i,'of',len(df))
+    
+    for trajectory in df.iloc[f].Tracks:
+        medCoordinate = np.int_(np.floor(np.median(trajectory,axis=0) / resolution))
+        df.iloc[f,medIdx][medCoordinate[1],medCoordinate[0]] += 1
+
+gaussian_sigma =1.5; # pixels to blur
+threshold = 2 ; # threshold of number of trajectories w/ median coordinate in pixel after blur
+resolution = 100; # nm/pixel
+maxFilterSize = 2;
+borderMask = 5; # number of pixels to exclude on border
+
+#make the mask
+def add_mask(spotMedians):
+    global i
+    clear_output(wait=True)
+    i += 1
+
+    print('Making masks for file',i,'of',len(df))
+
+    maskImage = gaussian_filter(spotMedians, gaussian_sigma)
+    maskImage = maskImage > threshold
+    maskImage = maximum_filter(maskImage, size=maxFilterSize)
+    maskImage[0:borderMask,:] = maskImage[:,0:borderMask] = maskImage[-borderMask:,:] = maskImage[:,-borderMask:] = 1
+
+    return maskImage
+
+i = 0
+df['maskImages'] = df['spotMedians'].apply(add_mask)
+
+#Plot tracks on images (if nothing shows on the image, check arrays and the treshold)
+import matplotlib.pylab as plt
+import seaborn as sns
+sns.reset_defaults()
+sns.set(rc={'figure.figsize':(15,10)})
+sns.set_style("ticks")
+#@title Show some example mask images
+
+def show_mask(df, maxplot=5):
+    maxplot = min(len(df),maxplot)
+    fig = plt.gcf()
+    fig.set_size_inches(25, 15)
+    
+    for i in range(maxplot):
+        plt.subplot(2,maxplot,i+1)
+        plt.imshow(df['spotMedians'].iloc[i],vmin=0, vmax=0.03*spotMedians[:,:,:].max())
+        plt.subplot(2,maxplot,maxplot+i+1)
+        plt.imshow(df['maskImages'].iloc[i],vmin=0, vmax=1)
+        
+    plt.show()
+
+    
+show_mask(df)
+
+# Calculate displacement data
+
+def calculate_mean_square_displacement(file):
+    minimum_trajectory_spots = 2 # @param {type:"slider", min:2, max:50, step: 1}
+    maximum_trajectory_spots = 6 # @param {type:"slider", min:2, max:100, step: 1}
+    maximum_points_per_trajectory = 1 # @param {type:"slider", min:1, max:100, step: 1}
+
+    mask_too_dense_spots = True  #@param {type:"boolean"}
+    
+    dt = 0.033 # time between frames in seconds
+    max_display_frames = 10 #@param {type:"slider", min:2, max:50, step: 1}
+    max_display_time = dt * max_display_frames
+    
+    maskImages = None
+    
+    global i
+    clear_output(wait=True)
+    i += 1
+    print('Calculating msds for',i,'of',len(df))
+
+    traj_lengths = np.array([len(trajectory) for trajectory in file])
+    max_length = traj_lengths.max()
+
+    if max_length > maximum_trajectory_spots:
+        max_length = traj_lengths[traj_lengths <= maximum_trajectory_spots].max()
+
+    sds = [[] for _ in range(1, max_length)]
+    all_displacements = np.empty(0)
+
+    for trajectory in file:
+
+        if len(trajectory) >= minimum_trajectory_spots and len(trajectory) <= maximum_trajectory_spots:
+            use_trajectory = 1
+
+            if mask_too_dense_spots and maskImages is not None:
+                medCoordinate = np.int_(np.floor(np.median(trajectory, axis=0) / resolution))
+                if maskImages[i, medCoordinate[1], medCoordinate[0]]:
+                    use_trajectory = 0
+
+            if use_trajectory:
+                maxJ = np.min([maximum_points_per_trajectory, len(trajectory) - 1])
+                displacements = (trajectory[1:, :] - trajectory[0, :]) / 1e3
+                all_displacements = np.sqrt(np.sum(((trajectory[1:, :] - trajectory[0:-1, :]) / 1e3) ** 2, axis=1))
+
+                for j in range(maxJ):
+                    traj_sds = np.sum(displacements ** 2, axis=1)
+                    for t in range(len(traj_sds)):
+                        sds[t].append(traj_sds[t])
+                    displacements = displacements[1:,:]-displacements[0,:]
+
+    mean_square_displacement = np.array([np.mean(x) for x in sds])
+    error_bar = np.array([np.std(x)/np.sqrt(len(x)) for x in sds])
+    measurement = np.array([len(x) for x in sds])
+    x = dt * np.arange(1 + len(mean_square_displacement))
+    x = x[1:]
+
+    return mean_square_displacement, error_bar, measurement, sds,x
+
+i = 0
+df[['MSD', 'MSD_error', 'MSD_N', "SDS", "Dt"]] = df.apply(lambda row: calculate_mean_square_displacement(row.Tracks), axis=1, result_type="expand")
+
+#Plot msd
+for i, row in df.iterrows():
+    plt.errorbar(row['Dt'], row['MSD'], yerr=row['MSD_error'], fmt='-o', label= row["Condition"])
+
+plt.xlabel('time (s)')
+plt.ylabel('Mean squared displacement (um^2)')
+plt.legend()
+plt.ylim([0,0.2])
+plt.show()
+sns.despine(top=True, right=True)
